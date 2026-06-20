@@ -1,0 +1,20 @@
+# Never commit the virtualenv - it's huge, path-locked, and arch-specific.
+# Recreate it with `npufast setup` or `pip install -r requirements.txt`.
+executorch-env/
+*-env/
+.venv/
+venv/
+
+# Model weights + compiled artifacts (large; regenerate via npufast)
+models/
+*.gguf
+*.pte
+*.pt2
+*.bin
+
+# Build trees / caches
+cmake-out*/
+build*/
+__pycache__/
+*.pyc
+.DS_Store
