@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# npufast - run quantized Hugging Face LLMs on the Qualcomm Hexagon NPU, the easy way.
+#
+#   HF model (base fp16)  ->  QNN QDQ quantize + AOT compile (V75)  ->  run on the HTP
+#
+# Target: Qualcomm Dragonwing IQ8 (QCS8300, Hexagon V75 HTP), Ubuntu 24.04 aarch64.
+# Drives ExecuTorch + QNN - the only working on-device NPU path on this platform
+# (llama.cpp's Hexagon backend is Android/Windows-only as of 2026).
+#
+# You supply the BASE fp16 weights from HF; QNN quantizes them (QDQ) during the compile.
+# Works for the architectures in ExecuTorch's decoder set - see `npufast list`.
+#
+# Commands:
+#   npufast setup                         # ONE-TIME: build the ExecuTorch+QNN toolchain
+#   npufast doctor                        # toolchain + NPU status
+#   npufast list                          # supported architectures
+#   npufast prep  <hf_repo|dir> [decoder] # download + QNN compile -> .pte artifact
+#   npufast bench <artifact>              # 7-run HTP benchmark, mean +/- std (warmup dropped)
+#   npufast run   <artifact> ["prompt"]   # generate on the HTP (echoes tokens)
+#   npufast auto  <hf_repo> [decoder]     # prep + bench
+#
+# Examples:
+#   npufast setup
+#   npufast auto HuggingFaceTB/SmolLM2-135M
+#   npufast auto meta-llama/Llama-3.2-3B-Instruct        # gated: huggingface-cli login first
+#   LFAST_DECODER=qwen3-1_7b npufast prep ./my-qwen-dir
+#
+# Env: EXECUTORCH QNN_SDK_ROOT SOC MAXSEQ SEQ TEMP MODELS LFAST_DECODER QNN_EXTRA
+#      ET_COMMIT VENV   (setup only)
+set -euo pipefail
+EXECUTORCH="${EXECUTORCH:-$HOME/executorch}"
+QNN_SDK_ROOT="${QNN_SDK_ROOT:-/usr}"
+SOC="${SOC:-SM8650}"            # QCS8300 -> V75 sibling. SM8550=V73 / SM8750=V79 will NOT load.
+MAXSEQ="${MAXSEQ:-1024}"        # compile-time max_seq_len
+SEQ="${SEQ:-256}"              # runtime seq_len for bench/run
+TEMP="${TEMP:-0.8}"            # run sampling temp (0=greedy -> repeats on tiny models)
+MODELS="${MODELS:-$PWD/models}"
+ET_COMMIT="${ET_COMMIT:-55c54c7}"
+VENV="${VENV:-$HOME/executorch-env}"
+PY="$VENV/bin/python"
+RUNNER="$EXECUTORCH/cmake-out-qnn/oss_scripts/llama/qnn_llama_runner"
+LLAMA_PY="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/llama.py"
+
+c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_red=$'\e[31m'; c_rst=$'\e[0m'
+say(){ printf '%s>>%s %s\n' "$c_grn" "$c_rst" "$*"; }
+warn(){ printf '%s!!%s %s\n' "$c_ylw" "$c_rst" "$*"; }
+die(){ printf '%sxx%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
+step(){ printf '\n%s===== %s =====%s\n' "$c_grn" "$*" "$c_rst"; }
+
+# HF repo -> ExecuTorch --decoder_model
+decoder_for(){ case "$1" in
+  *SmolLM2-135M*|smollm2_135m) echo smollm2_135m;;
+  *Llama-3.2-1B*) echo llama3_2-1b_instruct;;  *Llama-3.2-3B*) echo llama3_2-3b_instruct;;
+  *Qwen2.5-0.5B*) echo qwen2_5-0_5b;; *Qwen2.5-1.5B*) echo qwen2_5-1_5b;;
+  *Qwen3-0.6B*) echo qwen3-0_6b;; *Qwen3-1.7B*) echo qwen3-1_7b;;
+  *gemma-2-2b*|*gemma2-2b*) echo gemma2-2b;; *gemma-3-1b*|*gemma3-1b*) echo gemma3-1b;;
+  *Phi-4-mini*) echo phi_4_mini;; *SmolLM3-3B*) echo smollm3-3b;;
+  *) echo "${LFAST_DECODER:-}";; esac; }
+
+resolve_src(){ local src="$1"
+  [[ -d "$src" ]] && { echo "$src"; return; }
+  local dst="$MODELS/src/${src//\//_}"
+  if [[ ! -d "$dst" ]]; then say "downloading $src" >&2
+    huggingface-cli download "$src" --local-dir "$dst" --exclude "*.pth" "original/*" \
+      || die "download failed (gated? run: huggingface-cli login)"; fi
+  echo "$dst"; }
+
+_paths(){ if [[ -d "$1" ]]; then PTE="$1/kv_llama_qnn.pte"; TOK="$1/tokenizer.json"
+  else PTE="$1"; TOK="$(dirname "$1")/tokenizer.json"; fi; }
+
+# -------------------------------------------------------------- list / doctor
+cmd_list(){ cat <<TXT
+Supported decoder architectures (give the HF repo; auto-mapped, or set LFAST_DECODER):
+  smollm2_135m           HuggingFaceTB/SmolLM2-135M
+  llama3_2-1b_instruct   meta-llama/Llama-3.2-1B-Instruct      (gated)
+  llama3_2-3b_instruct   meta-llama/Llama-3.2-3B-Instruct      (gated)
+  qwen2_5-0_5b / 1_5b    Qwen/Qwen2.5-0.5B / 1.5B-Instruct
+  qwen3-0_6b / 1_7b      Qwen/Qwen3-0.6B / 1.7B
+  gemma2-2b / gemma3-1b  google/gemma-2-2b / gemma-3-1b
+  phi_4_mini             microsoft/Phi-4-mini-instruct
+  smollm3-3b             HuggingFaceTB/SmolLM3-3B
+Anything else needs a converter + quant recipe + QNN op-coverage check (not just weights).
+TXT
+}
+cmd_doctor(){
+  echo "== machine =="
+  echo -n "libQnnHtpPrepare : "; if file "$QNN_SDK_ROOT/lib/libQnnHtpPrepare.so" 2>/dev/null|grep -q aarch64; then echo "aarch64 (on-device compile OK)"; else echo "${c_ylw}not aarch64 - compile on x86 via npufast-host${c_rst}"; fi
+  echo -n "signed V75 skel  : "; [[ -f "$QNN_SDK_ROOT/lib/dsp/cdsp/libQnnHtpV75Skel.so" ]] && echo "present (no testsig wall)" || echo "${c_ylw}missing${c_rst}"
+  echo "SOC target       : $SOC (Hexagon V75)"
+  echo "== toolchain =="
+  [[ -x "$RUNNER" ]] && echo "runner       : ok" || echo "runner       : ${c_ylw}missing -> npufast setup${c_rst}"
+  ls "$EXECUTORCH"/backends/qualcomm/python/PyQnnManagerAdaptor*.so >/dev/null 2>&1 && echo "AOT pybind   : ok" || echo "AOT pybind   : ${c_ylw}missing -> npufast setup${c_rst}"
+  [[ -x "$PY" ]] && "$PY" -c "import torch,torchtune,transformers,safetensors" 2>/dev/null && echo "python env   : ok" || echo "python env   : ${c_ylw}missing/broken -> npufast setup${c_rst}"
+}
+
+# -------------------------------------------------------------- prep / bench / run
+cmd_prep(){
+  local src="${1:?usage: npufast prep <hf_repo|dir> [decoder]}"
+  local dm; dm="${2:-$(decoder_for "$src")}"
+  [[ -n "$dm" ]] || die "no architecture mapping for '$src'. QNN supports only its built-in decoders (npufast list). Set LFAST_DECODER=<name> to override."
+  [[ -f "$LLAMA_PY" ]] || die "executorch toolchain not found ($EXECUTORCH). Run: npufast setup"
+  local dir out; dir=$(resolve_src "$src"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
+  say "QNN AOT compile: $dm for $SOC (V75), max_seq_len=$MAXSEQ - takes minutes, quantizes the base weights"
+  QNN_SDK_ROOT="$QNN_SDK_ROOT" "$PY" "$LLAMA_PY" \
+    --decoder_model "$dm" --model_mode kv --max_seq_len "$MAXSEQ" \
+    --compile_only --soc_model "$SOC" --build_folder "$MODELS/build-$dm" \
+    --prompt "Once upon a time" --artifact "$out" ${QNN_EXTRA:-}
+  say "ready: $out/kv_llama_qnn.pte"; echo "$out"
+}
+cmd_bench(){
+  local art="${1:?usage: npufast bench <artifact>}"; _paths "$art"
+  [[ -f "$PTE" ]] || die "no .pte at $PTE (run: npufast prep ...)"
+  say "Hexagon V75 HTP: 7 runs (1 warmup + 6 measured), seq_len=$SEQ"
+  local vals=() v
+  for i in $(seq 0 6); do
+    "$RUNNER" --model_path "$PTE" --tokenizer_path "$TOK" \
+      --prompt "Once upon a time" --seq_len "$SEQ" --eval_mode 0 \
+      --performance_output_path "/tmp/npf_$i.txt" >/dev/null 2>&1 || die "runner failed - npufast doctor"
+    v=$(cat "/tmp/npf_$i.txt" 2>/dev/null || echo 0)
+    if (( i==0 )); then printf '  warmup: %s tok/s (dropped)\n' "$v"; else printf '  run %d : %s tok/s\n' "$i" "$v"; vals+=("$v"); fi
+  done
+  printf '%s\n' "${vals[@]}" | awk '{s+=$1;ss+=$1*$1;n++} END{m=s/n;v=(n>1)?(ss-s*s/n)/(n-1):0;printf "\n>> decode: %.2f +/- %.2f tok/s (n=%d, warmup dropped)\n",m,sqrt(v),n}'
+  warn "compare like-for-like: same model + same quant. A small base model repeats under greedy; this is sampled."
+}
+cmd_run(){
+  local art="${1:?usage: npufast run <artifact> [prompt]}"; shift||true
+  _paths "$art"; local p="${*:-Once upon a time}"
+  "$RUNNER" --model_path "$PTE" --tokenizer_path "$TOK" \
+    --prompt "$p" --seq_len "$SEQ" --eval_mode 0 --temperature "$TEMP"
+}
+cmd_auto(){ local o; o=$(cmd_prep "$@" | tail -1); cmd_bench "$o"; }
+
+# -------------------------------------------------------------- setup (one-time bootstrap)
+cmd_setup(){
+  step "PREFLIGHT"
+  command -v cmake >/dev/null || die "cmake not found"; command -v git >/dev/null || die "git not found"
+  command -v python3.12 >/dev/null || command -v python3 >/dev/null || die "python3.12 not found"
+  [[ -f "$QNN_SDK_ROOT/lib/libQnnHtpPrepare.so" ]] || die "QNN SDK not at $QNN_SDK_ROOT (set QNN_SDK_ROOT=)"
+  file "$QNN_SDK_ROOT/lib/libQnnHtpPrepare.so" | grep -q aarch64 \
+    && say "libQnnHtpPrepare aarch64 -> on-device AOT OK" \
+    || warn "libQnnHtpPrepare not aarch64 - compile on x86 (npufast-host) instead"
+  [[ -f "$QNN_SDK_ROOT/lib/dsp/cdsp/libQnnHtpV75Skel.so" ]] && say "signed V75 skel present" || warn "V75 skel missing - HTP load may fail"
+  if dpkg -l libgflags-dev >/dev/null 2>&1; then warn "removing system libgflags-dev (collides with in-tree gflags)"
+    sudo apt-get remove -y libgflags-dev 2>/dev/null || warn "remove libgflags-dev manually if the runner build fails"; fi
+
+  step "EXECUTORCH SOURCE @ $ET_COMMIT"
+  [[ -d "$EXECUTORCH/.git" ]] || git clone https://github.com/pytorch/executorch "$EXECUTORCH"
+  git -C "$EXECUTORCH" rev-parse --short HEAD | grep -q "$ET_COMMIT" || { warn "checkout $ET_COMMIT"; git -C "$EXECUTORCH" checkout "$ET_COMMIT"; }
+  git -C "$EXECUTORCH" submodule update --init --recursive
+
+  step "PYTHON ENV (pinned CPU/aarch64 set)"
+  [[ -d "$VENV" ]] || python3.12 -m venv "$VENV" 2>/dev/null || python3 -m venv "$VENV"
+  "$PY" -m pip install --upgrade pip
+  "$PY" -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+  printf 'torch==2.11.0\ntorchvision==0.26.0\n' > /tmp/eco-pin.txt
+  "$PY" -m pip install -c /tmp/eco-pin.txt torchao==0.17.0 torchtune==0.4.0 transformers==4.57.6 \
+    tokenizers==0.22.2 safetensors==0.8.0 huggingface_hub==0.36.2 lm_eval accelerate pydot
+  "$PY" -m pip install -c /tmp/eco-pin.txt --no-deps -e "$EXECUTORCH" || warn "editable install warned; cmake build below is what matters"
+
+  step "PATCHES"
+  f="$EXECUTORCH/backends/qualcomm/CMakeLists.txt"
+  if grep -q 'x86_64|AMD64|aarch64' "$f"; then say "p1 aarch64 un-gate: present"
+  elif grep -q 'x86_64|AMD64' "$f"; then sed -i 's/x86_64|AMD64"/x86_64|AMD64|aarch64"/' "$f"; say "p1 aarch64 un-gate: applied"
+  else warn "p1 anchor missing in $f - apply manually (Build B in docs)"; fi
+  f="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/qnn_llama_runner.cpp"
+  if grep -q 'fputs(piece.c_str()' "$f"; then say "p5 runner-echo: present"
+  elif grep -q 'auto callback = \[&\](const std::string& piece) {' "$f"; then
+    sed -i 's@auto callback = \[&\](const std::string& piece) {@&\n    fputs(piece.c_str(), stdout); fflush(stdout);@' "$f"; say "p5 runner-echo: applied"
+  else warn "p5 anchor missing - apply manually"; fi
+  f="$VENV/lib/python3.12/site-packages/torchtune/training/quantization.py"
+  if [[ -f "$f" ]] && ! grep -q LFAST_TORCHAO_SHIM "$f" && grep -q 'from torchao.quantization import' "$f"; then
+    "$PY" - "$f" <<'PYPATCH'
+import sys,re
+p=sys.argv[1]; s=open(p).read()
+m=re.search(r'(from torchao\.quantization import \([^)]*\)|from torchao\.quantization import [^\n]*)', s)
+if m:
+    blk=m.group(0); names=re.findall(r'\b(int4_weight_only|int8_dynamic_activation_int4_weight|quantize_)\b', blk)
+    fb="; ".join(f"{n} = None" for n in dict.fromkeys(names)) or "pass"
+    open(p,'w').write(s.replace(blk, f"# LFAST_TORCHAO_SHIM\ntry:\n    {blk}\nexcept Exception:\n    {fb}", 1))
+PYPATCH
+    grep -q LFAST_TORCHAO_SHIM "$f" && say "p3 torchao shim: applied" || warn "p3 manual"
+  else say "p3 torchao shim: present/not-needed"; fi
+  f="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/CMakeLists.txt"
+  grep -q 'if(NOT TARGET custom_ops)' "$f" 2>/dev/null && say "p2 custom_ops guard: present" \
+    || warn "p2 custom_ops/quantized_ops_lib guards in $f are bespoke - apply manually per Build A in docs"
+
+  step "BUILD: main tree (+install)"
+  cmake -S "$EXECUTORCH" -B "$EXECUTORCH/cmake-out" -DCMAKE_BUILD_TYPE=Release \
+    -DEXECUTORCH_BUILD_QNN=ON -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON -DEXECUTORCH_BUILD_KERNELS_LLM=ON \
+    -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON -DQNN_SDK_ROOT="$QNN_SDK_ROOT" \
+    -DPYTHON_EXECUTABLE="$PY" -DCMAKE_INSTALL_PREFIX="$EXECUTORCH/install"
+  cmake --build "$EXECUTORCH/cmake-out" -j"$(nproc)"; cmake --install "$EXECUTORCH/cmake-out"
+
+  step "BUILD: QNN AOT pybind"
+  cmake --build "$EXECUTORCH/cmake-out" --target PyQnnManagerAdaptor -j"$(nproc)"
+  so=$(find "$EXECUTORCH/cmake-out" -name "PyQnnManagerAdaptor.*.so" | head -1)
+  [[ -n "$so" ]] || die "PyQnnManagerAdaptor produced no .so"
+  cp "$so" "$EXECUTORCH/backends/qualcomm/python/"; say "placed $(basename "$so")"
+
+  step "BUILD: qnn_llama_runner"
+  cmake -S "$EXECUTORCH/examples/qualcomm" -B "$EXECUTORCH/cmake-out-qnn" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$EXECUTORCH/install" -DQNN_SDK_ROOT="$QNN_SDK_ROOT" \
+    -DPYTHON_EXECUTABLE="$PY" -Dgflags_DIR="$EXECUTORCH/cmake-out/third-party/gflags"
+  cmake --build "$EXECUTORCH/cmake-out-qnn" --target qnn_llama_runner -j"$(nproc)"
+  step "DONE"; cmd_doctor
+}
+
+# -------------------------------------------------------------- dispatch
+sub="${1:-}"; shift || true
+case "$sub" in
+  setup) cmd_setup;; doctor) cmd_doctor;; list) cmd_list;;
+  prep) cmd_prep "$@";; bench) cmd_bench "$@";; run) cmd_run "$@";; auto) cmd_auto "$@";;
+  *) grep '^#' "$0" | sed 's/^# \{0,1\}//;/^!/d'; exit 0;;
+esac

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# npufast-host - compile HF models for the IQ8's Hexagon V75 NPU on an x86 Linux host,
+#              then push the ready-to-run .pte to the device.
+#
+# This is the OPTIONAL two-machine topology. You do NOT need it: the IQ8 compiles
+# its own models on-device (npufast). Use this only when you'd rather compile
+# on a faster x86 box - e.g. the Mac mini in the fleet - than wait ~10 min on the IQ8.
+#
+# WHY AN x86 HOST CAN BUILD FOR AN aarch64 + HEXAGON DEVICE:
+#   The compiled .pte targets the HEXAGON ARCH (V75, via --soc_model SM8650), not the
+#   host CPU. So the artifact is portable to the IQ8 (also V75). And on x86 the QNN AOT
+#   Python bindings build with NO source patch (x86 is the natively-supported arch -
+#   the aarch64 un-gate was only needed to do this ON the device).
+#
+# IMPORTANT: the input is the BASE fp16 HF model. QNN quantizes it (QDQ) during the
+#   compile. You do not feed a pre-quantized GGUF/GPTQ/AWQ checkpoint into this path.
+#
+# Host needs : executorch+QNN built (x86), QNN SDK, huggingface-cli, ssh+rsync to device.
+# Device needs: qnn_llama_runner already built once (see: npufast setup / doctor).
+#
+# Usage:
+#   npufast-host deploy <hf_repo> [decoder]      # compile here + push to device
+#   npufast-host prep   <hf_repo> [decoder]      # compile here only -> local artifact
+#   npufast-host push   <artifact_dir>           # rsync an existing artifact to device
+#   npufast-host bench  <artifact_dir>           # benchmark remotely on the device
+#   npufast-host run    <artifact_dir> ["text"]  # generate remotely on the device
+#
+# Env:
+#   EXECUTORCH    host executorch dir   (default ~/executorch)
+#   QNN_SDK_ROOT  host QNN SDK          (default /usr)
+#   SOC           target soc            (default SM8650 = QCS8300's V75 sibling)
+#   DEVICE        ssh target for IQ8    (default iq8)
+#   DEV_MODELS    artifact dir on dev   (default models, relative to device $HOME)
+#   DEV_RUNNER    runner on device      (default executorch/cmake-out-qnn/oss_scripts/llama/qnn_llama_runner)
+#   CTX           max_seq_len           (default 1024)
+#   LFAST_DECODER explicit decoder name when the repo isn't auto-mapped
+#   QNN_EXTRA     extra llama.py args   (e.g. "--checkpoint <dir>")
+#   TEMP          sampling temp for run (default 0.8)
+set -euo pipefail
+EXECUTORCH="${EXECUTORCH:-$HOME/executorch}"
+QNN_SDK_ROOT="${QNN_SDK_ROOT:-/usr}"
+SOC="${SOC:-SM8650}"
+DEVICE="${DEVICE:-iq8}"
+DEV_MODELS="${DEV_MODELS:-models}"
+DEV_RUNNER="${DEV_RUNNER:-executorch/cmake-out-qnn/oss_scripts/llama/qnn_llama_runner}"
+CTX="${CTX:-1024}"
+MODELS="${MODELS:-$PWD/models}"
+LLAMA_PY="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/llama.py"
+
+c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_red=$'\e[31m'; c_rst=$'\e[0m'
+say(){ printf '%s>>%s %s\n' "$c_grn" "$c_rst" "$*"; }
+warn(){ printf '%s!!%s %s\n' "$c_ylw" "$c_rst" "$*"; }
+die(){ printf '%sxx%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
+
+decoder_for(){ case "$1" in
+  *SmolLM2-135M*|smollm2_135m) echo smollm2_135m;;
+  *Llama-3.2-1B*) echo llama3_2-1b_instruct;;  *Llama-3.2-3B*) echo llama3_2-3b_instruct;;
+  *Qwen2.5-0.5B*) echo qwen2_5-0_5b;; *Qwen2.5-1.5B*) echo qwen2_5-1_5b;;
+  *Qwen3-0.6B*) echo qwen3-0_6b;; *Qwen3-1.7B*) echo qwen3-1_7b;;
+  *gemma-2-2b*|*gemma2-2b*) echo gemma2-2b;; *gemma-3-1b*|*gemma3-1b*) echo gemma3-1b;;
+  *Phi-4-mini*) echo phi_4_mini;; *SmolLM3-3B*) echo smollm3-3b;;
+  *) echo "${LFAST_DECODER:-}";; esac; }
+
+resolve_src(){ local src="$1"
+  [[ -d "$src" ]] && { echo "$src"; return; }
+  local dst="$MODELS/src/${src//\//_}"
+  if [[ ! -d "$dst" ]]; then say "downloading $src" >&2
+    huggingface-cli download "$src" --local-dir "$dst" --exclude "*.pth" "original/*" \
+      || die "download failed (gated? run: huggingface-cli login)"; fi
+  echo "$dst"; }
+
+cmd_prep(){
+  local src="${1:?usage: npufast-host prep <hf_repo> [decoder]}"
+  local dm; dm="${2:-$(decoder_for "$src")}"
+  [[ -n "$dm" ]] || die "no decoder mapping for '$src'; pass it or set LFAST_DECODER (must be in llama.py enum)"
+  [[ -f "$LLAMA_PY" ]] || die "executorch not found at $EXECUTORCH (set EXECUTORCH=)"
+  local dir out; dir=$(resolve_src "$src"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
+  say "AOT compiling $dm for $SOC (V75) on $(uname -m) host - quantizes the base weights"
+  QNN_SDK_ROOT="$QNN_SDK_ROOT" python3 "$LLAMA_PY" \
+    --decoder_model "$dm" --model_mode kv --max_seq_len "$CTX" \
+    --compile_only --soc_model "$SOC" --build_folder "$MODELS/build-$dm" \
+    --prompt "Once upon a time" --artifact "$out" ${QNN_EXTRA:-}
+  say "compiled: $out/kv_llama_qnn.pte"; echo "$out"
+}
+
+cmd_push(){
+  local art="${1:?usage: npufast-host push <artifact_dir>}"; local name; name=$(basename "$art")
+  [[ -f "$art/kv_llama_qnn.pte" ]] || die "no .pte in $art"
+  say "pushing $name -> $DEVICE:$DEV_MODELS/$name  (.pte + tokenizer only, not the QDQ intermediate)"
+  ssh "$DEVICE" "mkdir -p $DEV_MODELS/$name"
+  rsync -az --info=progress2 \
+    "$art/kv_llama_qnn.pte" "$art/tokenizer.json" \
+    "$DEVICE:$DEV_MODELS/$name/"
+  say "on device at $DEV_MODELS/$name"
+}
+
+cmd_deploy(){ local out; out=$(cmd_prep "$@" | tail -1); cmd_push "$out"; warn "now: npufast-host bench $out"; }
+
+cmd_bench(){
+  local art="${1:?usage: npufast-host bench <artifact_dir>}"; local name; name=$(basename "$art")
+  say "remote bench on $DEVICE (Hexagon V75 HTP), 6 runs"
+  ssh "$DEVICE" "for i in \$(seq 1 6); do \
+    $DEV_RUNNER --model_path $DEV_MODELS/$name/kv_llama_qnn.pte \
+      --tokenizer_path $DEV_MODELS/$name/tokenizer.json \
+      --prompt 'Once upon a time' --seq_len ${CTX:-256} --eval_mode 0 \
+      --performance_output_path /tmp/lh_\$i.txt >/dev/null 2>&1; \
+    echo \"run \$i: \$(cat /tmp/lh_\$i.txt) tok/s\"; done"
+  warn "drop run 1 (cold), average the rest"
+}
+
+cmd_run(){
+  local art="${1:?usage: npufast-host run <artifact_dir> [text]}"; shift||true
+  local name p; name=$(basename "$art"); p="${*:-Once upon a time}"
+  ssh -t "$DEVICE" "$DEV_RUNNER --model_path $DEV_MODELS/$name/kv_llama_qnn.pte \
+    --tokenizer_path $DEV_MODELS/$name/tokenizer.json \
+    --prompt '$p' --seq_len ${CTX:-128} --eval_mode 0 --temperature ${TEMP:-0.8}"
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  prep) cmd_prep "$@";; push) cmd_push "$@";; deploy) cmd_deploy "$@";;
+  bench) cmd_bench "$@";; run) cmd_run "$@";;
+  *) grep '^#' "$0" | sed 's/^# \{0,1\}//;/^!/d'; exit 0;;
+esac
