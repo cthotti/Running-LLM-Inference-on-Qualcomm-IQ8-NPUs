@@ -1,0 +1,30 @@
+# Python package manifest for the QNN/ExecuTorch NPU toolchain (aarch64 / CPU).
+# Recreates the package layer of ~/executorch-env.
+#
+# This is the PACKAGE manifest only. Full, correct reproduction is `npufast setup`,
+# because three things requirements.txt can't express on its own:
+#   1. torch + torchvision come from the PyTorch CPU index (handled by --extra-index-url below)
+#   2. executorch is BUILT FROM SOURCE (commit 55c54c7), not pip-installed
+#   3. a one-line shim is patched into torchtune (torchao API drift) by `npufast setup`
+#
+# To install just these packages by hand:
+#   python3.12 -m venv ~/executorch-env
+#   source ~/executorch-env/bin/activate
+#   pip install -r requirements.txt
+#
+# For a byte-exact snapshot of YOUR working env, also commit a freeze (see repo README):
+#   source ~/executorch-env/bin/activate && pip freeze > requirements-freeze.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.11.0
+torchvision==0.26.0
+torchao==0.17.0
+torchtune==0.4.0
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==0.36.2
+lm_eval
+accelerate
+pydot

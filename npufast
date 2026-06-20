@@ -60,9 +60,10 @@ decoder_for(){ case "$1" in
 resolve_src(){ local src="$1"
   [[ -d "$src" ]] && { echo "$src"; return; }
   local dst="$MODELS/src/${src//\//_}"
+  local hf="$VENV/bin/huggingface-cli"; [[ -x "$hf" ]] || hf="huggingface-cli"
   if [[ ! -d "$dst" ]]; then say "downloading $src" >&2
-    huggingface-cli download "$src" --local-dir "$dst" --exclude "*.pth" "original/*" \
-      || die "download failed (gated? run: huggingface-cli login)"; fi
+    "$hf" download "$src" --local-dir "$dst" --exclude "*.pth" "original/*" \
+      || die "download failed (gated? run: $hf login)"; fi
   echo "$dst"; }
 
 _paths(){ if [[ -d "$1" ]]; then PTE="$1/kv_llama_qnn.pte"; TOK="$1/tokenizer.json"
