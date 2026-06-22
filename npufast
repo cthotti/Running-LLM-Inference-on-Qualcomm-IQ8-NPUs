@@ -88,6 +88,15 @@ resolve_src(){ local src="$1"
 _paths(){ if [[ -d "$1" ]]; then PTE="$1/kv_llama_qnn.pte"; TOK="$1/tokenizer.json"
   else PTE="$1"; TOK="$(dirname "$1")/tokenizer.json"; fi; }
 
+# locate the flatc compiler binary. executorch's _get_flatc_path() only bundles flatc on a
+# SUCCESSFUL wheel build (ours fails under modern pip), then falls back to $FLATC_EXECUTABLE.
+# So we find the flatc the cmake build produced (or one we built on demand) and feed it via that
+# env var at compile time - otherwise QNN spec serialization dies with FileNotFoundError: 'flatc'.
+find_flatc(){ local d f
+  for d in "$EXECUTORCH/cmake-out-flatc" "$EXECUTORCH/cmake-out" "$EXECUTORCH/third-party"; do
+    f=$(find "$d" -name flatc -type f -perm -u+x 2>/dev/null | head -1); [[ -n "$f" ]] && { echo "$f"; return; }
+  done; }
+
 # -------------------------------------------------------------- list / doctor
 cmd_list(){ cat <<TXT
 Supported decoder architectures (give the HF repo; auto-mapped, or set LFAST_DECODER):
@@ -114,7 +123,8 @@ cmd_doctor(){
   echo "== toolchain =="
   [[ -x "$RUNNER" ]] && echo "runner       : ok" || echo "runner       : ${c_ylw}missing -> npufast setup${c_rst}"
   ls "$EXECUTORCH"/backends/qualcomm/python/PyQnnManagerAdaptor*.so >/dev/null 2>&1 && echo "AOT pybind   : ok" || echo "AOT pybind   : ${c_ylw}missing -> npufast setup${c_rst}"
-  [[ -x "$PY" ]] && "$PY" -c "import torch,torchtune,transformers,safetensors,executorch.exir" 2>/dev/null && echo "python env   : ok" || echo "python env   : ${c_ylw}missing/broken -> npufast setup${c_rst}"
+  [[ -x "$PY" ]] && "$PY" -c "import torch,torchtune,transformers,safetensors,executorch.exir,pytorch_tokenizers" 2>/dev/null && echo "python env   : ok" || echo "python env   : ${c_ylw}missing/broken -> npufast setup${c_rst}"
+  [[ -n "$(find_flatc)" ]] && echo "flatc        : ok" || echo "flatc        : ${c_ylw}missing -> npufast setup${c_rst}"
 }
 
 # -------------------------------------------------------------- prep / bench / run
@@ -137,7 +147,8 @@ cmd_prep(){
   fi
   local dir out; dir=$(resolve_src "$dlsrc"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
   say "QNN AOT compile: $dm for $SOC (V75), max_seq_len=$MAXSEQ - takes minutes, quantizes the base weights"
-  QNN_SDK_ROOT="$QNN_SDK_ROOT" "$PY" "$LLAMA_PY" \
+  local flatc; flatc="$(find_flatc)"
+  FLATC_EXECUTABLE="${flatc:-flatc}" QNN_SDK_ROOT="$QNN_SDK_ROOT" "$PY" "$LLAMA_PY" \
     --decoder_model "$dm" --model_mode kv --max_seq_len "$MAXSEQ" \
     --compile_only --soc_model "$SOC" --build_folder "$MODELS/build-$dm" \
     --prompt "Once upon a time" --artifact "$out" ${QNN_EXTRA:-}
@@ -193,18 +204,24 @@ cmd_setup(){
   [[ -d "$VENV" ]] || python3.12 -m venv "$VENV" 2>/dev/null || python3 -m venv "$VENV"
   "$PY" -m pip install --upgrade pip
   "$PY" -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
-  printf 'torch==2.11.0\ntorchvision==0.26.0\n' > /tmp/eco-pin.txt
+  # Constraint file pins the ENTIRE HF/torch stack, not just torch: executorch's deps below
+  # (pytorch-tokenizers -> tiktoken/tokenizers/sentencepiece) would otherwise bump tokenizers
+  # off 0.22.2 and break transformers==4.57.6. -c locks every version-sensitive package.
+  printf 'torch==2.11.0\ntorchvision==0.26.0\ntokenizers==0.22.2\ntransformers==4.57.6\nsafetensors==0.8.0\nhuggingface_hub==0.36.2\n' > /tmp/eco-pin.txt
   "$PY" -m pip install -c /tmp/eco-pin.txt torchao==0.17.0 torchtune==0.4.0 transformers==4.57.6 \
     tokenizers==0.22.2 safetensors==0.8.0 huggingface_hub==0.36.2 lm_eval accelerate pydot
   # ExecuTorch's OWN AOT-export runtime deps. Critical: the editable install below is --no-deps,
   # AND its wheel build fails under modern pip (build isolation hides torch from setup.py), so it
   # installs NONE of these. They must be installed explicitly or the AOT compile dies one
-  # ModuleNotFoundError at a time (cpuinfo -> ruamel.yaml -> flatbuffers -> ...). This list is the
-  # exir lower+serialize subset of executorch setup.py _base_dependencies(), PLUS py-cpuinfo, which
-  # backends/qualcomm/__init__.py imports at load time but setup.py does NOT declare. All ship
-  # universal/aarch64 wheels; the -c pin keeps any of them from dragging in a second torch.
+  # ModuleNotFoundError at a time. This is executorch setup.py _base_dependencies() (minus the
+  # coreml-only coremltools/scikit-learn) PLUS py-cpuinfo, which backends/qualcomm/__init__.py
+  # imports but setup.py does NOT declare. pytorch-tokenizers is required by
+  # extension/llm/export/builder.py (the AOT export builder) and ships a cp312 aarch64 wheel.
+  # All have universal/aarch64 wheels; the -c pin above stops any of them moving the HF stack.
   "$PY" -m pip install -c /tmp/eco-pin.txt \
-    flatbuffers "ruamel.yaml" sympy tabulate "mpmath==1.3.0" pyyaml py-cpuinfo
+    flatbuffers "ruamel.yaml" sympy tabulate "mpmath==1.3.0" pyyaml py-cpuinfo \
+    pytorch-tokenizers tiktoken sentencepiece \
+    expecttest hypothesis parameterized kgb hydra-core omegaconf
   # Editable install registers the 'executorch' import name. Its wheel build fails under pip>=25
   # build isolation (setup.py's cmake can't find torch in the isolated env). That is expected and
   # tolerated, because the symlink immediately below guarantees the import path regardless.
@@ -295,6 +312,19 @@ P2EOF
     -DCMAKE_PREFIX_PATH="$EXECUTORCH/install" -DQNN_SDK_ROOT="$QNN_SDK_ROOT" \
     -DPYTHON_EXECUTABLE="$PY" -Dgflags_DIR="$EXECUTORCH/cmake-out/third-party/gflags"
   cmake --build "$EXECUTORCH/cmake-out-qnn" --target qnn_llama_runner -j"$(nproc)"
+
+  step "FLATC (flatbuffers compiler - QNN compiler-spec serialization)"
+  fc="$(find_flatc)"
+  if [[ -z "$fc" ]]; then
+    warn "flatc not produced by the main build (flatbuffers built lib-only); compiling it now"
+    cmake -S "$EXECUTORCH/third-party/flatbuffers" -B "$EXECUTORCH/cmake-out-flatc" \
+      -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_FLATC=ON -DFLATBUFFERS_BUILD_TESTS=OFF
+    cmake --build "$EXECUTORCH/cmake-out-flatc" --target flatc -j"$(nproc)"
+    fc="$(find_flatc)"
+  fi
+  [[ -n "$fc" ]] && say "flatc: $fc" \
+    || warn "flatc still missing - AOT serialization will fail (FileNotFoundError: 'flatc')"
+
   step "DONE"; cmd_doctor
 }
 
