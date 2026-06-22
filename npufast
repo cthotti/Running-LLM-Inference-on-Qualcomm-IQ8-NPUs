@@ -211,8 +211,23 @@ PYPATCH
     fi
   fi
   f="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/CMakeLists.txt"
-  grep -q 'if(NOT TARGET custom_ops)' "$f" 2>/dev/null && say "p2 custom_ops guard: present" \
-    || warn "p2 custom_ops/quantized_ops_lib guards in $f are bespoke - apply manually per Build A in docs"
+  if grep -q 'if(NOT TARGET custom_ops)' "$f" 2>/dev/null; then say "p2 custom_ops guard: present"
+  else
+    python3 - "$f" <<'P2EOF'
+import sys; f=sys.argv[1]; s=open(f).read()
+# the installed ExecuTorch already exports imported targets custom_ops + quantized_ops_lib;
+# the runner CMakeLists re-defines them -> "target already exists" -> guard / disable.
+s=s.replace("add_library(custom_ops ${CUSTOM_OP_SRCS_FILE})",
+            "if(NOT TARGET custom_ops)\nadd_library(custom_ops ${CUSTOM_OP_SRCS_FILE})",1)
+s=s.replace("executorch_target_link_options_shared_lib(custom_ops)",
+            "executorch_target_link_options_shared_lib(custom_ops)\nendif()",1)
+s=s.replace("executorch_target_link_options_shared_lib(quantized_ops_lib)",
+            "# executorch_target_link_options_shared_lib(quantized_ops_lib)  # patched: imported target",1)
+open(f,'w').write(s)
+P2EOF
+    grep -q 'if(NOT TARGET custom_ops)' "$f" && say "p2 custom_ops guard + quantized_ops_lib: applied" \
+      || die "p2 patch failed to apply to $f"
+  fi
 
   step "BUILD: main tree (+install)"
   cmake -S "$EXECUTORCH" -B "$EXECUTORCH/cmake-out" -DCMAKE_BUILD_TYPE=Release \
