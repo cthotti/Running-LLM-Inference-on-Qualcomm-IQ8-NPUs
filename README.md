@@ -40,6 +40,7 @@ npufast prep  <hf_repo|dir> [decoder] # download + QNN compile -> .pte
 npufast bench <artifact>              # 7-run HTP benchmark, mean +/- std (warmup dropped)
 npufast run   <artifact> ["prompt"]   # generate on the HTP
 npufast auto  <hf_repo> [decoder]     # prep + bench
+npufast-bigmem <hf_repo> [decoder]    # big models on-device: SSD + swap + A78-pin + reduced MAXSEQ
 ```
 
 ## Quickstart
@@ -70,7 +71,8 @@ npufast-host bench models/llama3_2-3b_instruct_qnn
 ## Supported models
 
 The architectures in ExecuTorch's decoder set: Llama-3.2-1B/3B, Qwen2.5-0.5B/1.5B,
-Qwen3-0.6B/1.7B, Gemma-2-2B, Gemma-3-1B, Phi-4-mini, GLM, SmolLM2/SmolLM3. Run `npufast list`.
+Qwen3-0.6B/1.7B, Gemma-2B/2-2B/3-1B, Phi-4-mini, GLM-Edge-1.5B, Granite-3.3-2B, CodeGen2-1B,
+SmolLM2/SmolLM3. Run `npufast list`.
 Other architectures need a converter + quant recipe + an op-coverage check — not just weights.
 
 ## Honesty / caveats
@@ -81,7 +83,21 @@ Other architectures need a converter + quant recipe + an op-coverage check — n
 - NPU support is **per-architecture** (op coverage), not universal.
 - Throughput is model-dependent. A 135M model at ~106 tok/s is **not** comparable to a 3B at
   CPU baseline speed — compare like-for-like (same model, same quant).
+- Models from ~1B up are gated by the **compile**'s RAM peak, not runtime. Use `npufast-bigmem`
+  (on-device, SSD + swap) or `npufast-host` (x86/host) for those; runtime on the IQ8 is fine.
 - QNN CLI flags drift between releases; tunables are env vars at the top of the script.
+
+## Measured (Qualcomm IQ8, Hexagon V75, on-device)
+
+| Model | Decode | Compile |
+|---|---|---|
+| SmolLM2-135M | ~106 tok/s | ~10 min, in-RAM |
+| Qwen2.5-1.5B-Instruct | 26.7 tok/s | ~58 min, SSD + swap |
+| Granite-3.3-2B-Instruct | 23.0 tok/s | ~1h45m, `npufast-bigmem` (SSD swap, MAXSEQ=512, A78-pinned) |
+| Qwen2.5-1.5B on CPU (llama.cpp) | ~6 tok/s | — |
+
+Same-model NPU-vs-CPU: **~4.3×** on the 1.5B. Decode is memory-bandwidth-bound, so tok/s
+declines with model size (more weight bytes read per token).
 
 ## Docs
 

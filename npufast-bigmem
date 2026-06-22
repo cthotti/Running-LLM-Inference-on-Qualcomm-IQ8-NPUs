@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# npufast-bigmem - compile a large model (>=~1.5B) ENTIRELY on the device.
+#
+# Standing up a 1.5B-3B model's AOT compile on a ~10GB-RAM edge box is gated by the
+# compile's memory peak, not by runtime. This sets up the proven memory+speed
+# environment, then runs `npufast auto` pinned to the performance cores with a
+# reduced compile sequence length.
+#
+#   npufast-bigmem <hf_repo> [decoder]
+#
+# What it does, in order:
+#   - remounts the SSD with the fast in-kernel ntfs3 driver (falls back to ntfs-3g)
+#   - drops caches, reclaims old swap
+#   - creates the largest safe swapfile on internal ext4
+#   - (optional) adds a fast SSD loop-swap, preferred over the slow eMMC swap
+#   - sets vm.swappiness=100 so the kernel uses swap instead of OOM-killing
+#   - pins the compile to the highest-clock (performance / A78) cores
+#   - runs `npufast auto` with MAXSEQ (default 512) to shrink the compile memory peak
+#
+# Env:
+#   SSD_MNT   (/mnt/ssd)     SSD mount point
+#   SSD_DEV   (auto)         SSD partition, e.g. /dev/sdi1 (auto-detected from SSD_MNT)
+#   MAXSEQ    (512)          compile-time max_seq_len; drop to 256 if it still OOMs
+#   SSD_SWAP_G(0)            add this many GB of fast SSD loop-swap (e.g. 48); 0 = off
+#   INT_HEADROOM_G (10)      GB to leave free on internal / when sizing the swapfile
+#   MODELS    ($SSD_MNT/models)
+#   (plus anything npufast reads: SOC, SEQ, TEMP, ...)
+set -euo pipefail
+SSD_MNT="${SSD_MNT:-/mnt/ssd}"
+MAXSEQ="${MAXSEQ:-512}"
+SSD_SWAP_G="${SSD_SWAP_G:-0}"
+INT_HEADROOM_G="${INT_HEADROOM_G:-10}"
+repo="${1:?usage: npufast-bigmem <hf_repo> [decoder]   (e.g. npufast-bigmem ibm-granite/granite-3.3-2b-instruct)}"
+dec="${2:-}"
+
+c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_0=$'\e[0m'
+say(){ printf '%s>>%s %s\n' "$c_g" "$c_0" "$*"; }
+warn(){ printf '%s!!%s %s\n' "$c_y" "$c_0" "$*"; }
+die(){ printf '%sxx%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
+command -v npufast >/dev/null || die "npufast not on PATH (run ./install.sh)"
+
+SSD_DEV="${SSD_DEV:-$(findmnt -no SOURCE "$SSD_MNT" 2>/dev/null || true)}"
+[[ -n "$SSD_DEV" ]] || die "SSD not mounted at $SSD_MNT and SSD_DEV unset. Pass SSD_DEV=/dev/sdX1 (see: lsblk)."
+
+say "clean slate: swapoff + drop caches"
+sudo swapoff -a || true
+sudo rm -f /swapfile /swapfile2 2>/dev/null || true
+sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+
+say "remount $SSD_DEV at $SSD_MNT with kernel ntfs3 (fast)"
+sudo umount "$SSD_MNT" 2>/dev/null || true
+if sudo mount -t ntfs3 -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" 2>/dev/null; then
+  say "SSD: kernel ntfs3"; NTFS3=1
+else
+  warn "ntfs3 unavailable (dirty volume?) -> ntfs-3g fallback (slower; SSD loop-swap disabled)"
+  sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" || die "remount failed"
+  NTFS3=0
+fi
+df -h "$SSD_MNT"
+
+say "internal ext4 swapfile"
+FREE_G=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+SWAP_G=$(( FREE_G > (INT_HEADROOM_G + 4) ? FREE_G - INT_HEADROOM_G : 4 ))
+sudo fallocate -l "${SWAP_G}G" /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
+say "internal swap: ${SWAP_G}G (of ${FREE_G}G free)"
+
+if (( SSD_SWAP_G > 0 )); then
+  if (( NTFS3 == 1 )); then
+    say "adding ${SSD_SWAP_G}G fast SSD loop-swap (preferred over eMMC)"
+    sudo rm -f "$SSD_MNT/swap.img"
+    sudo dd if=/dev/zero of="$SSD_MNT/swap.img" bs=1M count=$(( SSD_SWAP_G * 1024 )) status=progress
+    LOOP=$(sudo losetup -f --show "$SSD_MNT/swap.img")
+    sudo mkswap "$LOOP" >/dev/null && sudo swapon -p 10 "$LOOP"
+    say "SSD loop-swap: ${SSD_SWAP_G}G on $LOOP"
+  else
+    warn "SSD_SWAP_G set but SSD is ntfs-3g/FUSE - skipping (swap-on-FUSE can deadlock)"
+  fi
+fi
+sudo sysctl -w vm.swappiness=100 >/dev/null
+free -h
+
+FAST=$(for d in /sys/devices/system/cpu/cpu[0-9]*; do echo "$(cat "$d"/cpufreq/cpuinfo_max_freq) ${d##*cpu}"; done | sort -rn | head -4 | awk '{print $2}' | paste -sd,)
+say "pinning compile to performance cores: $FAST"
+
+export MODELS="${MODELS:-$SSD_MNT/models}"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+mkdir -p "$MODELS"
+say "compile: MAXSEQ=$MAXSEQ, decoder='${dec:-auto}', artifacts -> $MODELS"
+say "(if it gets Killed at HybridTextDecoder::compile: rerun with MAXSEQ=256, or set SSD_SWAP_G=48)"
+taskset -c "$FAST" env MAXSEQ="$MAXSEQ" ${dec:+LFAST_DECODER="$dec"} npufast auto "$repo"

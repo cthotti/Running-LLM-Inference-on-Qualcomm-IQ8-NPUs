@@ -55,6 +55,10 @@ decoder_for(){ case "$1" in
   *Qwen3-0.6B*) echo qwen3-0_6b;; *Qwen3-1.7B*) echo qwen3-1_7b;;
   *gemma-2-2b*|*gemma2-2b*) echo gemma2-2b;; *gemma-3-1b*|*gemma3-1b*) echo gemma3-1b;;
   *Phi-4-mini*) echo phi_4_mini;; *SmolLM3-3B*) echo smollm3-3b;;
+  *granite-3.3-2b*|*granite_3_3-2b*) echo granite_3_3-2b_instruct;;
+  *glm-edge-1.5b*|*glm-edge-1_5b*) echo glm-1_5b;;
+  *codegen2-1B*|*codegen2_1b*) echo codegen2_1b;;
+  *gemma-2b*) echo gemma-2b;;
   *) echo "${LFAST_DECODER:-}";; esac; }
 
 resolve_src(){ local src="$1"
@@ -80,6 +84,10 @@ Supported decoder architectures (give the HF repo; auto-mapped, or set LFAST_DEC
   gemma2-2b / gemma3-1b  google/gemma-2-2b / gemma-3-1b
   phi_4_mini             microsoft/Phi-4-mini-instruct
   smollm3-3b             HuggingFaceTB/SmolLM3-3B
+  granite_3_3-2b_instruct  ibm-granite/granite-3.3-2b-instruct
+  glm-1_5b               THUDM/glm-edge-1.5b-chat
+  codegen2_1b            Salesforce/codegen2-1B_P
+  gemma-2b               google/gemma-2b-it                    (gated)
 Anything else needs a converter + quant recipe + QNN op-coverage check (not just weights).
 TXT
 }
@@ -100,6 +108,11 @@ cmd_prep(){
   local dm; dm="${2:-$(decoder_for "$src")}"
   [[ -n "$dm" ]] || die "no architecture mapping for '$src'. QNN supports only its built-in decoders (npufast list). Set LFAST_DECODER=<name> to override."
   [[ -f "$LLAMA_PY" ]] || die "executorch toolchain not found ($EXECUTORCH). Run: npufast setup"
+  case "$dm" in *3b*|*2b*|*1_5b*|*1_7b*|llama3_2-1b*|qwen2_5-0_5b) 
+    freeg=$(free -g 2>/dev/null | awk "/^Mem:/{print \$2}"); swapg=$(free -g 2>/dev/null | awk "/^Swap:/{print \$2}"); 
+    if (( ${freeg:-0} + ${swapg:-0} < 50 )); then 
+      warn "large model AOT-compile is memory-hungry; you have ~$((${freeg:-0}+${swapg:-0}))G RAM+swap."; 
+      warn "if it gets Killed (OOM), use \"npufast-bigmem $src\" (sets up SSD+swap), or compile on a host (npufast-host)."; fi;; esac
   local dir out; dir=$(resolve_src "$src"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
   say "QNN AOT compile: $dm for $SOC (V75), max_seq_len=$MAXSEQ - takes minutes, quantizes the base weights"
   QNN_SDK_ROOT="$QNN_SDK_ROOT" "$PY" "$LLAMA_PY" \
@@ -141,6 +154,11 @@ cmd_setup(){
     && say "libQnnHtpPrepare aarch64 -> on-device AOT OK" \
     || warn "libQnnHtpPrepare not aarch64 - compile on x86 (npufast-host) instead"
   [[ -f "$QNN_SDK_ROOT/lib/dsp/cdsp/libQnnHtpV75Skel.so" ]] && say "signed V75 skel present" || warn "V75 skel missing - HTP load may fail"
+  if [[ -e "$QNN_SDK_ROOT/lib/x86_64-linux-clang/libQnnHtp.so" ]]; then say "x86 backend-lib symlink present"
+  else sudo mkdir -p "$QNN_SDK_ROOT/lib/x86_64-linux-clang" \
+      && sudo ln -sf "$QNN_SDK_ROOT"/lib/libQnn*.so "$QNN_SDK_ROOT/lib/x86_64-linux-clang/" \
+      && say "x86 backend-lib symlink created (ExecuTorch QNN expects it; needed for Qwen/Granite/GLM/etc.)" \
+      || warn "could not create x86 backend-lib symlink (need sudo) - see QUICKSTART troubleshooting"; fi
   if dpkg -l libgflags-dev >/dev/null 2>&1; then warn "removing system libgflags-dev (collides with in-tree gflags)"
     sudo apt-get remove -y libgflags-dev 2>/dev/null || warn "remove libgflags-dev manually if the runner build fails"; fi
 
@@ -168,19 +186,30 @@ cmd_setup(){
   elif grep -q 'auto callback = \[&\](const std::string& piece) {' "$f"; then
     sed -i 's@auto callback = \[&\](const std::string& piece) {@&\n    fputs(piece.c_str(), stdout); fflush(stdout);@' "$f"; say "p5 runner-echo: applied"
   else warn "p5 anchor missing - apply manually"; fi
+  # p3: torchao shim. Gate on whether the submodule ACTUALLY imports - never guess from a
+  # marker (that double-wrapped an already-guarded import once). Only patch if it's broken.
   f="$VENV/lib/python3.12/site-packages/torchtune/training/quantization.py"
-  if [[ -f "$f" ]] && ! grep -q LFAST_TORCHAO_SHIM "$f" && grep -q 'from torchao.quantization import' "$f"; then
-    "$PY" - "$f" <<'PYPATCH'
-import sys,re
-p=sys.argv[1]; s=open(p).read()
-m=re.search(r'(from torchao\.quantization import \([^)]*\)|from torchao\.quantization import [^\n]*)', s)
+  if [[ -f "$f" ]]; then
+    if "$PY" -c "import torchtune.training.quantization" 2>/dev/null; then
+      say "p3 torchao guard: not needed (torchtune.training.quantization imports fine)"
+    else
+      "$PY" - "$f" <<'PYPATCH'
+import sys, re
+F=sys.argv[1]; s=open(F).read()
+m=re.search(r'^from torchao\.quantization import (?:\([^)]*\)|.*)$', s, re.M)
 if m:
-    blk=m.group(0); names=re.findall(r'\b(int4_weight_only|int8_dynamic_activation_int4_weight|quantize_)\b', blk)
-    fb="; ".join(f"{n} = None" for n in dict.fromkeys(names)) or "pass"
-    open(p,'w').write(s.replace(blk, f"# LFAST_TORCHAO_SHIM\ntry:\n    {blk}\nexcept Exception:\n    {fb}", 1))
+    blk=m.group(0)
+    ind="\n".join(("    "+ln) if ln.strip() else ln for ln in blk.splitlines())
+    g="try:\n"+ind+"\nexcept Exception:\n    int4_weight_only = None\n    int8_dynamic_activation_int4_weight = None\n    quantize_ = None"
+    open(F,'w').write(s[:m.start()]+g+s[m.end():]); print("applied")
+else:
+    print("WARN torchao import not found")
 PYPATCH
-    grep -q LFAST_TORCHAO_SHIM "$f" && say "p3 torchao shim: applied" || warn "p3 manual"
-  else say "p3 torchao shim: present/not-needed"; fi
+      "$PY" -c "import torchtune.training.quantization" 2>/dev/null \
+        && say "p3 torchao guard: applied + verified" \
+        || warn "p3 still failing - inspect $f manually"
+    fi
+  fi
   f="$EXECUTORCH/examples/qualcomm/oss_scripts/llama/CMakeLists.txt"
   grep -q 'if(NOT TARGET custom_ops)' "$f" 2>/dev/null && say "p2 custom_ops guard: present" \
     || warn "p2 custom_ops/quantized_ops_lib guards in $f are bespoke - apply manually per Build A in docs"

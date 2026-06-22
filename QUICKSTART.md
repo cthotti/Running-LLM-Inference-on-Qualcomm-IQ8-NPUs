@@ -190,6 +190,7 @@ check — not just weights.
 |---|---|---|---|
 | SmolLM2-135M | ~106 tok/s | 163 MB | ~10 min, in-RAM |
 | Qwen2.5-1.5B-Instruct | 26.7 ± 0.2 tok/s | 1.01 GB | ~58 min, SSD + internal swap |
+| Granite-3.3-2B-Instruct | 23.0 ± 0.5 tok/s | — | ~1h45m on-device (SSD swap, MAXSEQ=512, A78-pinned) |
 | Qwen2.5-1.5B on **CPU** (llama.cpp) | ~6 tok/s | — | — |
 
 The NPU is **~4.3× faster than the CPU on the same 1.5B model** — and the read-per-token
@@ -200,6 +201,18 @@ HTP's compute.
 ---
 
 ## The compile-time memory wall (why bigger models need an SSD + swap)
+
+**The one-command path:** everything below is automated by `npufast-bigmem`, which sets up the
+SSD (fast `ntfs3` mount), the swapfile, `swappiness=100`, A78 core-pinning, and a reduced
+`MAXSEQ`, then compiles:
+
+```bash
+npufast-bigmem ibm-granite/granite-3.3-2b-instruct      # 2B, compiled entirely on the IQ8
+# if it OOMs at the compile stage, add fast SSD swap and shrink the peak:
+SSD_SWAP_G=48 MAXSEQ=256 npufast-bigmem ibm-granite/granite-3.3-2b-instruct
+```
+
+The rest of this section is what that script does, and how to do it by hand.
 
 **Why it's required.** The AOT compile is far more memory-hungry than the finished model. To
 QDQ-quantize, `llama.py` holds the full fp checkpoint **and** quantized copies **and**
@@ -223,10 +236,11 @@ files** (downloads + `.pte` + the multi-GB `.pt2` intermediate), **internal ext4
 the swapfile**. Find your SSD with `lsblk` / `df -h` (here it's `/dev/sdX1` → `/mnt/ssd`).
 
 ```bash
-# 1. Mount the SSD writable by your user (NTFS auto-mounts as root)
+# 1. Mount the SSD with the FAST in-kernel ntfs3 driver (not ntfs-3g/FUSE, which is
+#    single-threaded and pegs one core on multi-GB writes)
 sudo blkid /dev/sdX1                      # confirm TYPE="ntfs"
-sudo mkdir -p /mnt/ssd
-sudo mount -o uid=$(id -u),gid=$(id -g),umask=022 /dev/sdX1 /mnt/ssd
+sudo mkdir -p /mnt/ssd; sudo umount /mnt/ssd 2>/dev/null
+sudo mount -t ntfs3 -o uid=$(id -u),gid=$(id -g),umask=022 /dev/sdX1 /mnt/ssd
 
 # 2. Big swapfile on the INTERNAL ext4 disk (sized to cover the model's peak)
 sudo swapoff -a
@@ -240,9 +254,12 @@ export MODELS=/mnt/ssd/models
 export HF_HUB_DISABLE_SYMLINKS=1
 mkdir -p "$MODELS"
 
-# 4. Compile
-npufast prep Qwen/Qwen2.5-1.5B-Instruct
-npufast bench models/qwen2_5-1_5b_qnn     # MODELS is exported, so this resolves to the SSD
+# 4. Compile on the performance cores, with a reduced max_seq_len to shrink the peak
+FAST=$(for d in /sys/devices/system/cpu/cpu[0-9]*; do echo "$(cat $d/cpufreq/cpuinfo_max_freq) ${d##*cpu}"; done | sort -rn | head -4 | awk '{print $2}' | paste -sd,)
+taskset -c "$FAST" env MAXSEQ=512 npufast auto Qwen/Qwen2.5-1.5B-Instruct
+#   - taskset -> A78 cores (the QNN compile is single-threaded; an A55 crawls)
+#   - MAXSEQ=512 -> halves the sequence-dependent compile memory AND speeds it up
+#   - need more headroom? add fast SSD loop-swap (ntfs3 only): see below
 ```
 
 Two settings that matter:

@@ -4,7 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${BIN:-$HOME/.local/bin}"
 mkdir -p "$BIN"
-for t in npufast npufast-host; do
+for t in npufast npufast-host npufast-bigmem; do
   if [[ -f "$DIR/bin/$t" ]]; then src="$DIR/bin/$t"; else src="$DIR/$t"; fi
   [[ -f "$src" ]] || { echo "skip: $t not found"; continue; }
   chmod +x "$src"; ln -sf "$src" "$BIN/$t"; echo "linked $BIN/$t -> $src"
