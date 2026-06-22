@@ -61,6 +61,21 @@ decoder_for(){ case "$1" in
   *gemma-2b*) echo gemma-2b;;
   *) echo "${LFAST_DECODER:-}";; esac; }
 
+# decoder key -> canonical HF repo. Lets users pass the short key shown by `npufast list`
+# (e.g. "smollm2_135m") instead of the full repo string; the downloader needs a real repo id.
+repo_for(){ case "$1" in
+  smollm2_135m) echo HuggingFaceTB/SmolLM2-135M;;
+  llama3_2-1b_instruct) echo meta-llama/Llama-3.2-1B-Instruct;;
+  llama3_2-3b_instruct) echo meta-llama/Llama-3.2-3B-Instruct;;
+  qwen2_5-0_5b) echo Qwen/Qwen2.5-0.5B-Instruct;; qwen2_5-1_5b) echo Qwen/Qwen2.5-1.5B-Instruct;;
+  qwen3-0_6b) echo Qwen/Qwen3-0.6B;; qwen3-1_7b) echo Qwen/Qwen3-1.7B;;
+  gemma2-2b) echo google/gemma-2-2b;; gemma3-1b) echo google/gemma-3-1b;;
+  phi_4_mini) echo microsoft/Phi-4-mini-instruct;; smollm3-3b) echo HuggingFaceTB/SmolLM3-3B;;
+  granite_3_3-2b_instruct) echo ibm-granite/granite-3.3-2b-instruct;;
+  glm-1_5b) echo THUDM/glm-edge-1.5b-chat;; codegen2_1b) echo Salesforce/codegen2-1B_P;;
+  gemma-2b) echo google/gemma-2b-it;;
+  *) echo "";; esac; }
+
 resolve_src(){ local src="$1"
   [[ -d "$src" ]] && { echo "$src"; return; }
   local dst="$MODELS/src/${src//\//_}"
@@ -99,13 +114,15 @@ cmd_doctor(){
   echo "== toolchain =="
   [[ -x "$RUNNER" ]] && echo "runner       : ok" || echo "runner       : ${c_ylw}missing -> npufast setup${c_rst}"
   ls "$EXECUTORCH"/backends/qualcomm/python/PyQnnManagerAdaptor*.so >/dev/null 2>&1 && echo "AOT pybind   : ok" || echo "AOT pybind   : ${c_ylw}missing -> npufast setup${c_rst}"
-  [[ -x "$PY" ]] && "$PY" -c "import torch,torchtune,transformers,safetensors" 2>/dev/null && echo "python env   : ok" || echo "python env   : ${c_ylw}missing/broken -> npufast setup${c_rst}"
+  [[ -x "$PY" ]] && "$PY" -c "import torch,torchtune,transformers,safetensors,executorch.exir" 2>/dev/null && echo "python env   : ok" || echo "python env   : ${c_ylw}missing/broken -> npufast setup${c_rst}"
 }
 
 # -------------------------------------------------------------- prep / bench / run
 cmd_prep(){
   local src="${1:?usage: npufast prep <hf_repo|dir> [decoder]}"
   local dm; dm="${2:-$(decoder_for "$src")}"
+  # accept a bare decoder key as the positional too (repo_for knows the full key set)
+  [[ -z "$dm" && -n "$(repo_for "$src")" ]] && dm="$src"
   [[ -n "$dm" ]] || die "no architecture mapping for '$src'. QNN supports only its built-in decoders (npufast list). Set LFAST_DECODER=<name> to override."
   [[ -f "$LLAMA_PY" ]] || die "executorch toolchain not found ($EXECUTORCH). Run: npufast setup"
   case "$dm" in *3b*|*2b*|*1_5b*|*1_7b*|llama3_2-1b*|qwen2_5-0_5b) 
@@ -113,7 +130,12 @@ cmd_prep(){
     if (( ${freeg:-0} + ${swapg:-0} < 50 )); then 
       warn "large model AOT-compile is memory-hungry; you have ~$((${freeg:-0}+${swapg:-0}))G RAM+swap."; 
       warn "if it gets Killed (OOM), use \"npufast-bigmem $src\" (sets up SSD+swap), or compile on a host (npufast-host)."; fi;; esac
-  local dir out; dir=$(resolve_src "$src"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
+  # if the user passed a bare decoder key (not a path, no org/ prefix), download the canonical repo
+  local dlsrc="$src"
+  if [[ ! -d "$src" && "$src" != */* ]]; then
+    local canon; canon="$(repo_for "$dm")"; [[ -n "$canon" ]] && dlsrc="$canon"
+  fi
+  local dir out; dir=$(resolve_src "$dlsrc"); mkdir -p "$MODELS"; out="$MODELS/${dm}_qnn"
   say "QNN AOT compile: $dm for $SOC (V75), max_seq_len=$MAXSEQ - takes minutes, quantizes the base weights"
   QNN_SDK_ROOT="$QNN_SDK_ROOT" "$PY" "$LLAMA_PY" \
     --decoder_model "$dm" --model_mode kv --max_seq_len "$MAXSEQ" \
@@ -174,7 +196,30 @@ cmd_setup(){
   printf 'torch==2.11.0\ntorchvision==0.26.0\n' > /tmp/eco-pin.txt
   "$PY" -m pip install -c /tmp/eco-pin.txt torchao==0.17.0 torchtune==0.4.0 transformers==4.57.6 \
     tokenizers==0.22.2 safetensors==0.8.0 huggingface_hub==0.36.2 lm_eval accelerate pydot
-  "$PY" -m pip install -c /tmp/eco-pin.txt --no-deps -e "$EXECUTORCH" || warn "editable install warned; cmake build below is what matters"
+  # ExecuTorch's OWN AOT-export runtime deps. Critical: the editable install below is --no-deps,
+  # AND its wheel build fails under modern pip (build isolation hides torch from setup.py), so it
+  # installs NONE of these. They must be installed explicitly or the AOT compile dies one
+  # ModuleNotFoundError at a time (cpuinfo -> ruamel.yaml -> flatbuffers -> ...). This list is the
+  # exir lower+serialize subset of executorch setup.py _base_dependencies(), PLUS py-cpuinfo, which
+  # backends/qualcomm/__init__.py imports at load time but setup.py does NOT declare. All ship
+  # universal/aarch64 wheels; the -c pin keeps any of them from dragging in a second torch.
+  "$PY" -m pip install -c /tmp/eco-pin.txt \
+    flatbuffers "ruamel.yaml" sympy tabulate "mpmath==1.3.0" pyyaml py-cpuinfo
+  # Editable install registers the 'executorch' import name. Its wheel build fails under pip>=25
+  # build isolation (setup.py's cmake can't find torch in the isolated env). That is expected and
+  # tolerated, because the symlink immediately below guarantees the import path regardless.
+  "$PY" -m pip install -c /tmp/eco-pin.txt --no-deps -e "$EXECUTORCH" \
+    || warn "editable install warned (expected under modern pip); import path handled by symlink"
+  # Guarantee 'import executorch' resolves to the source tree even when the editable wheel build
+  # failed (pip then registers nothing - confirmed by 'pip show executorch' finding nothing).
+  # ExecuTorch is flat-layout: the repo root IS the 'executorch' package, so one symlink into
+  # site-packages is sufficient and avoids putting all of $HOME on sys.path (which would shadow
+  # ~/models, ~/nputop, etc.).
+  sp="$("$PY" -c 'import site; print(site.getsitepackages()[0])')"
+  ln -sfn "$EXECUTORCH" "$sp/executorch"
+  "$PY" -c "import executorch.exir" 2>/dev/null \
+    && say "executorch import: ok (exir lower/serialize path)" \
+    || warn "executorch.exir still not importable - check: $PY -c 'import executorch.exir'"
 
   step "PATCHES"
   f="$EXECUTORCH/backends/qualcomm/CMakeLists.txt"
