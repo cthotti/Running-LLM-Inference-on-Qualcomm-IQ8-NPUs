@@ -9,10 +9,10 @@
 #   npufast-bigmem <hf_repo> [decoder]
 #
 # What it does, in order:
-#   - remounts the SSD with the fast in-kernel ntfs3 driver (falls back to ntfs-3g)
+#   - mounts the SSD: native kernel mount for ext4/xfs, or ntfs3 (fallback ntfs-3g) for NTFS
 #   - drops caches, reclaims old swap
 #   - creates the largest safe swapfile on internal ext4
-#   - (optional) adds a fast SSD loop-swap, preferred over the slow eMMC swap
+#   - (optional) adds fast SSD swap: direct swapfile on ext4, loop image on ntfs3
 #   - sets vm.swappiness=100 so the kernel uses swap instead of OOM-killing
 #   - pins the compile to the highest-clock (performance / A78) cores
 #   - runs `npufast auto` with MAXSEQ (default 512) to shrink the compile memory peak
@@ -47,14 +47,34 @@ sudo swapoff -a || true
 sudo rm -f /swapfile /swapfile2 2>/dev/null || true
 sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
-say "remount $SSD_DEV at $SSD_MNT with kernel ntfs3 (fast)"
-sudo umount "$SSD_MNT" 2>/dev/null || true
-if sudo mount -t ntfs3 -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" 2>/dev/null; then
-  say "SSD: kernel ntfs3"; NTFS3=1
+say "mount $SSD_DEV at $SSD_MNT"
+SSD_SWAPOK=0; SSD_LOOP=0
+if mountpoint -q "$SSD_MNT" && [[ "$(findmnt -no SOURCE "$SSD_MNT" 2>/dev/null)" == "$SSD_DEV" ]]; then
+  mfs=$(findmnt -no FSTYPE "$SSD_MNT" 2>/dev/null)
+  case "$mfs" in
+    ntfs3)   say "SSD already mounted (kernel ntfs3)"; SSD_SWAPOK=1; SSD_LOOP=1 ;;
+    fuseblk) warn "SSD already mounted (ntfs-3g/FUSE - SSD swap disabled)"; SSD_SWAPOK=0 ;;
+    *)       say "SSD already mounted ($mfs - swapfile-capable)"; SSD_SWAPOK=1 ;;
+  esac
 else
-  warn "ntfs3 unavailable (dirty volume?) -> ntfs-3g fallback (slower; SSD loop-swap disabled)"
-  sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" || die "remount failed"
-  NTFS3=0
+  sudo umount "$SSD_MNT" 2>/dev/null || true
+  sudo mkdir -p "$SSD_MNT"
+  fstype=$(lsblk -no FSTYPE "$SSD_DEV" 2>/dev/null | head -1)
+  if [[ "$fstype" == ntfs ]]; then
+    if sudo mount -t ntfs3 -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" 2>/dev/null; then
+      say "SSD: kernel ntfs3 (fast)"; SSD_SWAPOK=1; SSD_LOOP=1
+    else
+      warn "ntfs3 unavailable (dirty volume?) -> ntfs-3g fallback (slower; SSD swap disabled)"
+      sudo mount -t ntfs-3g -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SSD_DEV" "$SSD_MNT" || die "remount failed"
+      SSD_SWAPOK=0
+    fi
+  else
+    # ext4/xfs/native: kernel auto-detect, NO ntfs-only uid/gid/umask options (ext4 rejects them).
+    # A journaled fs also survives the brownouts that corrupted the old NTFS volume, and can host
+    # a swapfile directly (no loop device needed).
+    sudo mount "$SSD_DEV" "$SSD_MNT" || die "mount failed (fs='${fstype:-unknown}')"
+    say "SSD: ${fstype:-native} (journaled, swapfile-capable)"; SSD_SWAPOK=1
+  fi
 fi
 df -h "$SSD_MNT"
 
@@ -66,13 +86,23 @@ sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
 say "internal swap: ${SWAP_G}G (of ${FREE_G}G free)"
 
 if (( SSD_SWAP_G > 0 )); then
-  if (( NTFS3 == 1 )); then
-    say "adding ${SSD_SWAP_G}G fast SSD loop-swap (preferred over eMMC)"
-    sudo rm -f "$SSD_MNT/swap.img"
-    sudo dd if=/dev/zero of="$SSD_MNT/swap.img" bs=1M count=$(( SSD_SWAP_G * 1024 )) status=progress
-    LOOP=$(sudo losetup -f --show "$SSD_MNT/swap.img")
-    sudo mkswap "$LOOP" >/dev/null && sudo swapon -p 10 "$LOOP"
-    say "SSD loop-swap: ${SSD_SWAP_G}G on $LOOP"
+  if (( SSD_SWAPOK == 1 )); then
+    sudo swapoff "$SSD_MNT/swapfile" "$SSD_MNT/swap.img" 2>/dev/null || true
+    sudo rm -f "$SSD_MNT/swapfile" "$SSD_MNT/swap.img"
+    if (( SSD_LOOP == 1 )); then
+      # NTFS can't host a swapfile directly -> loop device over an image file
+      say "adding ${SSD_SWAP_G}G SSD loop-swap (ntfs)"
+      sudo dd if=/dev/zero of="$SSD_MNT/swap.img" bs=1M count=$(( SSD_SWAP_G * 1024 )) status=progress
+      LOOP=$(sudo losetup -f --show "$SSD_MNT/swap.img")
+      sudo mkswap "$LOOP" >/dev/null && sudo swapon -p 10 "$LOOP"
+      say "SSD loop-swap: ${SSD_SWAP_G}G on $LOOP"
+    else
+      # ext4/native -> direct swapfile (faster + simpler than a loop device)
+      say "adding ${SSD_SWAP_G}G SSD swapfile (ext4 direct)"
+      sudo fallocate -l "${SSD_SWAP_G}G" "$SSD_MNT/swapfile" && sudo chmod 600 "$SSD_MNT/swapfile"
+      sudo mkswap "$SSD_MNT/swapfile" >/dev/null && sudo swapon -p 10 "$SSD_MNT/swapfile"
+      say "SSD swapfile: ${SSD_SWAP_G}G at $SSD_MNT/swapfile"
+    fi
   else
     warn "SSD_SWAP_G set but SSD is ntfs-3g/FUSE - skipping (swap-on-FUSE can deadlock)"
   fi
